@@ -10,6 +10,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-10-07): child-channel writes issued during a key
+// re-exchange are held and released in order instead of being dropped. See BRIZMO-PATCH.md
+// and https://github.com/apple/swift-nio-ssh/issues/250.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -63,6 +67,25 @@ public final class NIOSSHHandler {
 
     private var pendingGlobalRequestResponses: CircularBuffer<PendingGlobalRequestResponse?>
 
+    // BRIZMO PATCH (apple/swift-nio-ssh#250): child-channel messages held back while a key re-exchange is in flight.
+    //
+    // Once the remote peer (or we) start a re-key, the connection state machine refuses to serialize any
+    // connection-protocol message until our own NEWKEYS has been sent (RFC 4253 §7.1). Child channels
+    // know nothing about that: upstream handed their writes straight to `writeMessage`, the state machine threw,
+    // and the error was only reported to the write promise — which is `nil` for most multiplexer writes
+    // (window adjusts, channel open/close) and is routinely ignored for data. The bytes were silently lost.
+    //
+    // Instead we hold every child-channel message, in submission order, while the state machine is in a state
+    // that forbids channel messages, and release them as soon as it leaves that state. While anything is held,
+    // later child writes are held too, so ordering is never changed. Held promises are only completed when the
+    // message actually reaches the parent channel, or failed if the handler goes away first.
+    //
+    // Memory is bounded by SSH flow control: channel data can only be issued against the peer's window.
+    private var childWritesHeldForKeyExchange: CircularBuffer<(message: SSHMessage, promise: EventLoopPromise<Void>?)>
+
+    // Guards against re-entrant release: a promise completed during release may trigger another child write.
+    private var isReleasingChildWritesHeldForKeyExchange: Bool = false
+
     /// Construct a new ``NIOSSHHandler``.
     ///
     /// - parameters:
@@ -80,6 +103,7 @@ public final class NIOSSHHandler {
         self.pendingChannelInitializations = CircularBuffer(initialCapacity: 4)
         self.pendingGlobalRequests = CircularBuffer(initialCapacity: 4)
         self.pendingGlobalRequestResponses = CircularBuffer(initialCapacity: 4)
+        self.childWritesHeldForKeyExchange = CircularBuffer(initialCapacity: 4)
         self.multiplexer = SSHChannelMultiplexer(
             delegate: self,
             allocator: allocator,
@@ -143,6 +167,13 @@ extension NIOSSHHandler: ChannelDuplexHandler {
         while let next = self.pendingChannelInitializations.popFirst() {
             next.promise?.fail(ChannelError.eof)
         }
+
+        // BRIZMO PATCH (#250): writes still held for a key re-exchange can never be sent now; fail them rather than
+        // leaving their promises dangling. `self.context` is already nil, so anything a failure callback writes is
+        // failed immediately by `writeFromChildChannel`.
+        while let held = self.childWritesHeldForKeyExchange.popFirst() {
+            held.promise?.fail(ChannelError.eof)
+        }
     }
 
     public func channelActive(context: ChannelHandlerContext) {
@@ -179,6 +210,11 @@ extension NIOSSHHandler: ChannelDuplexHandler {
                 loop: context.eventLoop
             ) {
                 try self.processInboundMessageResult(result, context: context)
+
+                // BRIZMO PATCH (#250): processing this message may have written our NEWKEYS (server role: it is
+                // emitted together with the key exchange reply) or a disconnect; either way held child writes may
+                // be releasable now. The flush happens in channelReadComplete, as for every write in this loop.
+                self.releaseChildWritesHeldForKeyExchangeIfPossible(context: context)
             }
         } catch {
             context.fireErrorCaught(error)
@@ -234,6 +270,9 @@ extension NIOSSHHandler: ChannelDuplexHandler {
                 case .success(.some(let message)):
                     do {
                         try self.writeMessage(message, context: context)
+                        // BRIZMO PATCH (#250): client role sends NEWKEYS from here, after host key validation,
+                        // which may complete long after the read loop. Release held child writes before the flush.
+                        self.releaseChildWritesHeldForKeyExchangeIfPossible(context: context)
                         self.pendingWrite = false
                         context.flush()
                     } catch {
@@ -528,6 +567,9 @@ extension NIOSSHHandler {
     internal func _disconnect() throws {
         // As this is test-only there are a bunch of preconditions in here, we don't really mind if we hit them in testing.
         try self.writeMessage(.init(.disconnect(.init(reason: 0, description: "", tag: ""))), context: self.context!)
+        // BRIZMO PATCH (#250): we are now in `sentDisconnect`, so nothing held for a key re-exchange can ever be
+        // sent. Releasing converges them: each held write fails exactly like a direct write after disconnect would.
+        self.releaseChildWritesHeldForKeyExchangeIfPossible(context: self.context!)
         self.context!.flush()
     }
 }
@@ -541,11 +583,60 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
             return
         }
 
+        // BRIZMO PATCH (#250): during a key re-exchange the state machine rejects channel messages; hold them
+        // instead of losing them. If anything is already held, hold this one too so ordering is preserved.
+        // Outside a re-key nothing is ever held, so this falls through to the unmodified upstream path.
+        if self.stateMachine.isKeyExchangeBlockingChannelMessages || !self.childWritesHeldForKeyExchange.isEmpty {
+            self.childWritesHeldForKeyExchange.append((message: message, promise: promise))
+            self.releaseChildWritesHeldForKeyExchangeIfPossible(context: context)
+            return
+        }
+
         do {
             try self.writeMessage(SSHMultiMessage(message), context: context, promise: promise)
         } catch {
             promise?.fail(error)
         }
+    }
+
+    /// BRIZMO PATCH (#250): writes held child-channel messages, oldest first, for as long as the connection state
+    /// machine accepts channel messages.
+    ///
+    /// Each message is written exactly as `writeFromChildChannel` would have written it outside a re-key: its own
+    /// promise, and on a serialization error that promise is failed and the next message is tried (for example after
+    /// a disconnect every held write fails with the same error a direct write would have got).
+    ///
+    /// Inside `channelRead` the flush is left to `channelReadComplete` (like every other write there); otherwise we
+    /// flush here, because the child channel's own flush already happened while its write was held.
+    private func releaseChildWritesHeldForKeyExchangeIfPossible(context: ChannelHandlerContext) {
+        guard !self.childWritesHeldForKeyExchange.isEmpty, !self.isReleasingChildWritesHeldForKeyExchange else {
+            return
+        }
+
+        self.isReleasingChildWritesHeldForKeyExchange = true
+        defer { self.isReleasingChildWritesHeldForKeyExchange = false }
+
+        var wroteAny = false
+        while !self.stateMachine.isKeyExchangeBlockingChannelMessages,
+            let held = self.childWritesHeldForKeyExchange.popFirst()
+        {
+            do {
+                try self.writeMessage(SSHMultiMessage(held.message), context: context, promise: held.promise)
+                wroteAny = true
+            } catch {
+                held.promise?.fail(error)
+            }
+        }
+
+        if wroteAny, !self.expectingChannelReadComplete, self.context != nil {
+            self.pendingWrite = false
+            context.flush()
+        }
+    }
+
+    /// Test-only: the number of child-channel messages currently held back by a key re-exchange.
+    internal var _childWritesHeldForKeyExchangeCount: Int {
+        self.childWritesHeldForKeyExchange.count
     }
 
     func flushFromChildChannel() {

@@ -10,6 +10,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-10-07): added `isKeyExchangeBlockingChannelMessages`
+// for NIOSSHHandler's re-key write holding. See BRIZMO-PATCH.md and
+// https://github.com/apple/swift-nio-ssh/issues/250.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -1257,6 +1261,26 @@ extension SSHConnectionStateMachine {
         case .idle, .sentVersion, .keyExchange, .receivedNewKeys, .sentNewKeys, .userAuthentication, .active,
             .receivedKexInitWhenActive, .sentKexInitWhenActive, .rekeying, .rekeyingReceivedNewKeysState,
             .rekeyingSentNewKeysState:
+            return false
+        }
+    }
+
+    /// BRIZMO PATCH (apple/swift-nio-ssh#250): whether a key re-exchange currently forbids sending
+    /// connection-protocol (channel) messages.
+    ///
+    /// These are exactly the post-activation states whose `processOutboundMessage` branch throws
+    /// `protocolViolation` for every channel message: from the moment either side's KEXINIT is in play until we
+    /// have sent our own NEWKEYS (RFC 4253 §7.1). `rekeyingSentNewKeysState` is deliberately excluded: after our
+    /// NEWKEYS we may send channel messages again, and the state machine accepts them there.
+    ///
+    /// Pre-activation states return `false` on purpose: child channels cannot exist before `.active`, and any
+    /// write attempted there keeps upstream behaviour (it is rejected).
+    var isKeyExchangeBlockingChannelMessages: Bool {
+        switch self.state {
+        case .receivedKexInitWhenActive, .sentKexInitWhenActive, .rekeying, .rekeyingReceivedNewKeysState:
+            return true
+        case .idle, .sentVersion, .keyExchange, .receivedNewKeys, .sentNewKeys, .userAuthentication, .active,
+            .rekeyingSentNewKeysState, .receivedDisconnect, .sentDisconnect:
             return false
         }
     }
