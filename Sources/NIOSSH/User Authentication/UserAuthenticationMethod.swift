@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): keyboard-interactive user authentication
+// (RFC 4256) method bit, offer/request cases and challenge/response types. See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 import NIOCore
 
@@ -33,6 +36,13 @@ public struct NIOSSHAvailableUserAuthenticationMethods: OptionSet, Sendable {
     /// Host-based authentication is acceptable.
     public static let hostBased: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 2)
 
+    /// Keyboard-interactive authentication (RFC 4256) is acceptable. Added by the Brizmo project.
+    ///
+    /// Deliberately **not** part of ``all``: `.all` is what existing server delegates (for example
+    /// ``DenyAllServerAuthDelegate``) advertise in USERAUTH_FAILURE, and adding a method there would change
+    /// what those servers put on the wire. A server opts in by listing `.keyboardInteractive` explicitly.
+    public static let keyboardInteractive: NIOSSHAvailableUserAuthenticationMethods = .init(rawValue: 1 << 3)
+
     /// A short-hand for all supported authentication types.
     public static let all: NIOSSHAvailableUserAuthenticationMethods = [.publicKey, .password, .hostBased]
 }
@@ -49,6 +59,10 @@ extension NIOSSHAvailableUserAuthenticationMethods {
                 self.insert(.password)
             case "hostbased":
                 self.insert(.hostBased)
+            case "keyboard-interactive":
+                // Brizmo patch (RFC 4256): upstream dropped this name in `default:` below, so a
+                // keyboard-interactive-only server looked like it offered nothing at all.
+                self.insert(.keyboardInteractive)
             default:
                 // This is an unknown method, which we ignore.
                 break
@@ -63,7 +77,7 @@ extension NIOSSHAvailableUserAuthenticationMethods {
 
         // We need an array.
         var methods = [Substring]()
-        methods.reserveCapacity(3)
+        methods.reserveCapacity(4)
 
         if self.contains(.password) {
             methods.append("password")
@@ -73,6 +87,9 @@ extension NIOSSHAvailableUserAuthenticationMethods {
         }
         if self.contains(.hostBased) {
             methods.append("hostbased")
+        }
+        if self.contains(.keyboardInteractive) {
+            methods.append("keyboard-interactive")
         }
 
         return methods
@@ -112,10 +129,28 @@ extension NIOSSHUserAuthenticationRequest {
 
         /// The client believes it does not need authentication.
         case none
+
+        /// The client would like to perform keyboard-interactive authentication (RFC 4256).
+        ///
+        /// The server delegate answers it through
+        /// ``NIOSSHServerUserAuthenticationDelegate/keyboardInteractiveRequestReceived(request:responsePromise:)``,
+        /// not through `requestReceived`. Added by the Brizmo project.
+        case keyboardInteractive(KeyboardInteractive)
     }
 }
 
 extension NIOSSHUserAuthenticationRequest.Request {
+    /// Information provided by the client when starting keyboard-interactive authentication (RFC 4256 §3.1).
+    /// Added by the Brizmo project.
+    public struct KeyboardInteractive: Sendable {
+        /// The submethods the client suggests (RFC 4256 §3.1); usually empty. Servers may ignore them.
+        public var submethods: [String]
+
+        public init(submethods: [String]) {
+            self.submethods = submethods
+        }
+    }
+
     /// Information provided by the client when attempting to perform a public-key authentication.
     public struct PublicKey: Sendable {
         /// The user's public key.
@@ -156,6 +191,8 @@ extension NIOSSHUserAuthenticationRequest.Request.Password: Hashable {}
 
 extension NIOSSHUserAuthenticationRequest.Request.HostBased: Hashable {}
 
+extension NIOSSHUserAuthenticationRequest.Request.KeyboardInteractive: Hashable {}
+
 /// A specific offer of user authentication. This type is the one used on the client side. The
 /// associated server side type is ``NIOSSHUserAuthenticationRequest``.
 public struct NIOSSHUserAuthenticationOffer: Sendable {
@@ -187,10 +224,28 @@ extension NIOSSHUserAuthenticationOffer {
 
         /// The client believes it does not need authentication.
         case none
+
+        /// The client would like to perform keyboard-interactive authentication (RFC 4256).
+        ///
+        /// The server's prompts are delivered to
+        /// ``NIOSSHClientUserAuthenticationDelegate/keyboardInteractiveChallengeReceived(_:responsePromise:)``.
+        /// Added by the Brizmo project.
+        case keyboardInteractive(KeyboardInteractive)
     }
 }
 
 extension NIOSSHUserAuthenticationOffer.Offer {
+    /// Information provided by the client when starting keyboard-interactive authentication (RFC 4256 §3.1).
+    /// Added by the Brizmo project.
+    public struct KeyboardInteractive: Sendable {
+        /// Submethods to suggest to the server (RFC 4256 §3.1). Leave empty unless the server documents them.
+        public var submethods: [String]
+
+        public init(submethods: [String] = []) {
+            self.submethods = submethods
+        }
+    }
+
     /// Information provided by the client when attempting to perform private key authentication.
     public struct PrivateKey: Sendable {
         /// The client's private key.
@@ -256,7 +311,86 @@ extension SSHMessage.UserAuthRequestMessage {
             fatalError("Unsupported")
         case .none:
             self.method = .none
+        case .keyboardInteractive(let keyboardInteractive):
+            self.method = .keyboardInteractive(submethods: keyboardInteractive.submethods)
         }
+    }
+}
+
+// MARK: - Keyboard-interactive challenge and response (Brizmo patch, RFC 4256)
+
+/// One round of keyboard-interactive prompts sent by the server (SSH_MSG_USERAUTH_INFO_REQUEST, RFC 4256 §3.2).
+///
+/// Added by the Brizmo project.
+public struct NIOSSHKeyboardInteractiveChallenge: Hashable, Sendable {
+    /// One prompt. `echo == false` means the answer is secret (for example a password).
+    public struct Prompt: Hashable, Sendable {
+        public var text: String
+        public var echo: Bool
+
+        public init(text: String, echo: Bool) {
+            self.text = text
+            self.echo = echo
+        }
+    }
+
+    public var name: String
+    public var instruction: String
+    /// Deprecated by RFC 4256 §3.2; usually empty.
+    public var languageTag: String
+    /// May be empty: RFC 4256 §3.4 still requires an (empty) response in that case.
+    public var prompts: [Prompt]
+
+    public init(name: String = "", instruction: String = "", languageTag: String = "", prompts: [Prompt]) {
+        self.name = name
+        self.instruction = instruction
+        self.languageTag = languageTag
+        self.prompts = prompts
+    }
+}
+
+/// The client's answers to one ``NIOSSHKeyboardInteractiveChallenge`` (SSH_MSG_USERAUTH_INFO_RESPONSE,
+/// RFC 4256 §3.4). `responses.count` must equal the challenge's `prompts.count`; NIOSSH fails the connection
+/// rather than send a response with a different count.
+///
+/// Added by the Brizmo project.
+public struct NIOSSHKeyboardInteractiveResponse: Hashable, Sendable {
+    public var responses: [String]
+
+    public init(responses: [String]) {
+        self.responses = responses
+    }
+}
+
+/// What a server user authentication delegate does next in a keyboard-interactive exchange: ask (another)
+/// round of prompts, or finish the attempt. Added by the Brizmo project.
+public enum NIOSSHKeyboardInteractiveServerStep: Sendable {
+    /// Send these prompts to the client (SSH_MSG_USERAUTH_INFO_REQUEST).
+    case challenge(NIOSSHKeyboardInteractiveChallenge)
+
+    /// Finish the attempt with SUCCESS or FAILURE, exactly like `requestReceived`.
+    case outcome(NIOSSHUserAuthenticationOutcome)
+}
+
+extension NIOSSHKeyboardInteractiveChallenge {
+    init(_ message: SSHMessage.UserAuthInfoRequestMessage) {
+        self.init(
+            name: message.name,
+            instruction: message.instruction,
+            languageTag: message.languageTag,
+            prompts: message.prompts.map { Prompt(text: $0.prompt, echo: $0.echo) }
+        )
+    }
+}
+
+extension SSHMessage.UserAuthInfoRequestMessage {
+    init(_ challenge: NIOSSHKeyboardInteractiveChallenge) {
+        self.init(
+            name: challenge.name,
+            instruction: challenge.instruction,
+            languageTag: challenge.languageTag,
+            prompts: challenge.prompts.map { Prompt(prompt: $0.text, echo: $0.echo) }
+        )
     }
 }
 
@@ -279,6 +413,29 @@ enum NIOSSHUserAuthenticationResponseMessage {
     case failure(SSHMessage.UserAuthFailureMessage)
     case publicKeyOK(SSHMessage.UserAuthPKOKMessage)
     case disconnect(SSHMessage.DisconnectMessage)
+}
+
+/// Brizmo patch (RFC 4256): what the server sends back for one USERAUTH_REQUEST or INFO_RESPONSE.
+///
+/// A separate type, rather than a new case on ``NIOSSHUserAuthenticationResponseMessage``, so that every
+/// existing exhaustive switch over that type (including upstream tests) is unchanged.
+enum NIOSSHUserAuthenticationServerStepMessage {
+    case response(NIOSSHUserAuthenticationResponseMessage)
+    case infoRequest(SSHMessage.UserAuthInfoRequestMessage)
+    /// The keyboard-interactive attempt this result belongs to was aborted by a newer USERAUTH_REQUEST
+    /// (RFC 4252 §5.1): send nothing, report nothing.
+    case abandoned
+}
+
+extension NIOSSHUserAuthenticationServerStepMessage {
+    init(_ step: NIOSSHKeyboardInteractiveServerStep, supportedMethods: NIOSSHAvailableUserAuthenticationMethods) {
+        switch step {
+        case .challenge(let challenge):
+            self = .infoRequest(.init(challenge))
+        case .outcome(let outcome):
+            self = .response(.init(outcome, supportedMethods: supportedMethods))
+        }
+    }
 }
 
 extension NIOSSHUserAuthenticationResponseMessage {

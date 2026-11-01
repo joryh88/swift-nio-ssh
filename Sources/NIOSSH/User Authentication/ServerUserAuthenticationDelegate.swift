@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): keyboard-interactive request/response callbacks
+// (RFC 4256) with default implementations, so existing conformers compile unchanged. See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -38,4 +41,59 @@ public protocol NIOSSHServerUserAuthenticationDelegate {
         request: NIOSSHUserAuthenticationRequest,
         responsePromise: EventLoopPromise<NIOSSHUserAuthenticationOutcome>
     )
+
+    /// A keyboard-interactive USERAUTH_REQUEST (RFC 4256 §3.1) has been received. Added by the Brizmo project.
+    ///
+    /// Only called when ``supportedAuthenticationMethods`` contains
+    /// ``NIOSSHAvailableUserAuthenticationMethods/keyboardInteractive``; otherwise NIOSSH answers FAILURE
+    /// itself. Complete `responsePromise` with a challenge (sent as SSH_MSG_USERAUTH_INFO_REQUEST) or an
+    /// outcome. The default implementation answers `.outcome(.failure)`. If the client sends a new
+    /// USERAUTH_REQUEST before the promise is completed, this attempt is aborted (RFC 4252 §5.1): whatever the
+    /// promise is completed with later — including an error — is dropped and nothing is sent for it. The same
+    /// holds for ``keyboardInteractiveResponseReceived(username:response:responsePromise:)``.
+    ///
+    /// - parameters:
+    ///     - request: The received request; its `request` is `.keyboardInteractive`.
+    ///     - responsePromise: An `EventLoopPromise` that must be completed with the next step.
+    func keyboardInteractiveRequestReceived(
+        request: NIOSSHUserAuthenticationRequest,
+        responsePromise: EventLoopPromise<NIOSSHKeyboardInteractiveServerStep>
+    )
+
+    /// The client answered our last keyboard-interactive challenge (SSH_MSG_USERAUTH_INFO_RESPONSE,
+    /// RFC 4256 §3.4). Added by the Brizmo project.
+    ///
+    /// Only called when the number of responses equals the number of prompts we sent; a mismatch is answered
+    /// with FAILURE by NIOSSH without calling this. Complete `responsePromise` with another challenge or an
+    /// outcome. Responses do not count toward `maxAuthAttempts` (only USERAUTH_REQUEST messages do). The
+    /// default implementation answers `.outcome(.failure)`.
+    ///
+    /// - parameters:
+    ///     - username: The user name of the keyboard-interactive request this response belongs to.
+    ///     - response: The client's answers, one per prompt.
+    ///     - responsePromise: An `EventLoopPromise` that must be completed with the next step.
+    func keyboardInteractiveResponseReceived(
+        username: String,
+        response: NIOSSHKeyboardInteractiveResponse,
+        responsePromise: EventLoopPromise<NIOSSHKeyboardInteractiveServerStep>
+    )
+}
+
+extension NIOSSHServerUserAuthenticationDelegate {
+    /// Default (Brizmo patch): a delegate that does not implement keyboard-interactive rejects it.
+    public func keyboardInteractiveRequestReceived(
+        request: NIOSSHUserAuthenticationRequest,
+        responsePromise: EventLoopPromise<NIOSSHKeyboardInteractiveServerStep>
+    ) {
+        responsePromise.succeed(.outcome(.failure))
+    }
+
+    /// Default (Brizmo patch): a delegate that does not implement keyboard-interactive rejects it.
+    public func keyboardInteractiveResponseReceived(
+        username: String,
+        response: NIOSSHKeyboardInteractiveResponse,
+        responsePromise: EventLoopPromise<NIOSSHKeyboardInteractiveServerStep>
+    ) {
+        responsePromise.succeed(.outcome(.failure))
+    }
 }

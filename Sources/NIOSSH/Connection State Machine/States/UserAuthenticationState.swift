@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): switches the packet parser's user-auth message context
+// for keyboard-interactive (RFC 4256). See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -57,6 +60,26 @@ extension SSHConnectionStateMachine {
 
         mutating func bufferInboundData(_ data: inout ByteBuffer) {
             self.parser.append(bytes: &data)
+        }
+
+        /// Brizmo patch (RFC 4252 §6, RFC 4256 §3.2): message number 60 means INFO_REQUEST while our
+        /// keyboard-interactive request is in flight and PK_OK otherwise. Only a client receives 60, so only
+        /// the client switches its parser; this is the only place the context is set.
+        mutating func updateUserAuthMessageContext(afterSending message: SSHMessage.UserAuthRequestMessage) {
+            guard self.role.isClient else {
+                return
+            }
+            switch message.method {
+            case .keyboardInteractive:
+                self.parser.userAuthMessageContext = .keyboardInteractive
+            case .none, .password, .publicKey:
+                self.parser.userAuthMessageContext = .default
+            }
+        }
+
+        /// Brizmo patch: USERAUTH_SUCCESS/FAILURE ends the request in flight; 60 means PK_OK again.
+        mutating func resetUserAuthMessageContext() {
+            self.parser.userAuthMessageContext = .default
         }
     }
 }

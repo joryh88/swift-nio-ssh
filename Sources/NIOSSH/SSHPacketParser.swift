@@ -10,11 +10,26 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): user-auth message context so that message number 60
+// can be read as SSH_MSG_USERAUTH_INFO_REQUEST (RFC 4256). See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
 
 struct SSHPacketParser {
+    /// Brizmo patch (RFC 4252 §6, RFC 4256 §3.2): what an inbound message number 60 means.
+    ///
+    /// 60 is SSH_MSG_USERAUTH_PK_OK while a "publickey" request is in flight and
+    /// SSH_MSG_USERAUTH_INFO_REQUEST while a "keyboard-interactive" one is; the bytes cannot tell them apart.
+    /// `.default` keeps the upstream behaviour (60 is PK_OK). Only the user authentication state switches it
+    /// (client side, when it writes a keyboard-interactive request, and back on SUCCESS/FAILURE). Message
+    /// number 61 is always SSH_MSG_USERAUTH_INFO_RESPONSE and does not depend on this.
+    enum UserAuthMessageContext {
+        case `default`
+        case keyboardInteractive
+    }
+
     enum State {
         case initialized
         case cleartextWaitingForLength
@@ -50,6 +65,9 @@ struct SSHPacketParser {
     /// string, bounded by `maximumPreambleLineCount`.
     private var preambleLineCount: Int
 
+    /// Brizmo patch: see ``UserAuthMessageContext``. Internal, never part of the public API.
+    var userAuthMessageContext: UserAuthMessageContext
+
     /// Testing only: the number of bytes we can discard from this buffer.
     internal var _discardableBytes: Int {
         self.buffer.readerIndex
@@ -75,6 +93,7 @@ struct SSHPacketParser {
         // Add headroom for the SSH framing and padding (RFC 4253 §6).
         self.maximumEncryptedPacketLength = maximumPacketSize + 1024
         self.preambleLineCount = 0
+        self.userAuthMessageContext = .default
     }
 
     mutating func append(bytes: inout ByteBuffer) {
@@ -321,6 +340,7 @@ struct SSHPacketParser {
             )
         }
 
+        let userAuthContext = self.userAuthMessageContext
         return try self.buffer.rewindReaderOnError { buffer in
             guard var buffer = buffer.readSlice(length: Int(length) + MemoryLayout<UInt32>.size) else {
                 return nil
@@ -330,7 +350,8 @@ struct SSHPacketParser {
             buffer.moveReaderIndex(forwardBy: MemoryLayout<UInt32>.size)
 
             var content = try buffer.sliceContentFromPadding()
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0
+            guard let message = try content.readSSHMessage(userAuthContext: userAuthContext),
+                content.readableBytes == 0, buffer.readableBytes == 0
             else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat
@@ -341,13 +362,15 @@ struct SSHPacketParser {
     }
 
     private mutating func parseCiphertext(length: UInt32, protection: NIOSSHTransportProtection) throws -> SSHMessage? {
-        try self.buffer.rewindReaderOnError { buffer in
+        let userAuthContext = self.userAuthMessageContext
+        return try self.buffer.rewindReaderOnError { buffer in
             guard var buffer = buffer.readSlice(length: Int(length) + MemoryLayout<UInt32>.size) else {
                 return nil
             }
 
             var content = try protection.decryptAndVerifyRemainingPacket(&buffer, sequenceNumber: self.sequenceNumber)
-            guard let message = try content.readSSHMessage(), content.readableBytes == 0, buffer.readableBytes == 0
+            guard let message = try content.readSSHMessage(userAuthContext: userAuthContext),
+                content.readableBytes == 0, buffer.readableBytes == 0
             else {
                 // Throw this error if the content wasn't exactly the right length for the message.
                 throw NIOSSHError.invalidPacketFormat

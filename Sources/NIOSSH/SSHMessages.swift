@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): keyboard-interactive user authentication
+// (RFC 4256) wire messages. See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -38,6 +41,9 @@ enum SSHMessage: Equatable {
     case userAuthSuccess
     case userAuthBanner(UserAuthBannerMessage)
     case userAuthPKOK(UserAuthPKOKMessage)
+    // Brizmo patch (RFC 4256 §3.2 / §3.4).
+    case userAuthInfoRequest(UserAuthInfoRequestMessage)
+    case userAuthInfoResponse(UserAuthInfoResponseMessage)
     case globalRequest(GlobalRequestMessage)
     case requestSuccess(RequestSuccessMessage)
     case requestFailure
@@ -146,6 +152,9 @@ extension SSHMessage {
             case none
             case publicKey(PublicKeyAuthType)
             case password(String)
+            // Brizmo patch (RFC 4256 §3.1): "keyboard-interactive", string language tag (deprecated, we
+            // always write ""), string submethods (comma-separated).
+            case keyboardInteractive(submethods: [String])
         }
 
         enum PublicKeyAuthType: Equatable {
@@ -186,6 +195,37 @@ extension SSHMessage {
         static let id: UInt8 = 60
 
         var key: NIOSSHPublicKey
+    }
+
+    /// Brizmo patch (RFC 4256 §3.2): SSH_MSG_USERAUTH_INFO_REQUEST.
+    ///
+    /// Message number 60 is method-specific (RFC 4252 §6: "different authentication methods reuse the same
+    /// message numbers"): it is
+    /// SSH_MSG_USERAUTH_PK_OK while a "publickey" request is in flight and SSH_MSG_USERAUTH_INFO_REQUEST
+    /// while a "keyboard-interactive" one is. The bytes do not say which; the packet parser is told by the
+    /// user authentication state (see ``SSHPacketParser/UserAuthMessageContext``).
+    struct UserAuthInfoRequestMessage: Equatable {
+        // SSH_MSG_USERAUTH_INFO_REQUEST
+        static let id: UInt8 = 60
+
+        struct Prompt: Equatable {
+            var prompt: String
+            var echo: Bool
+        }
+
+        var name: String
+        var instruction: String
+        /// Deprecated by RFC 4256 §3.2; kept only so that the message round-trips.
+        var languageTag: String
+        var prompts: [Prompt]
+    }
+
+    /// Brizmo patch (RFC 4256 §3.4): SSH_MSG_USERAUTH_INFO_RESPONSE. Number 61 is only ever this message.
+    struct UserAuthInfoResponseMessage: Equatable {
+        // SSH_MSG_USERAUTH_INFO_RESPONSE
+        static let id: UInt8 = 61
+
+        var responses: [String]
     }
 
     struct GlobalRequestMessage: Equatable {
@@ -365,7 +405,13 @@ extension ByteBuffer {
     ///
     /// This function will consume as many bytes as the message should require. If it cannot read enough bytes,
     /// it will return nil.
-    mutating func readSSHMessage() throws -> SSHMessage? {
+    ///
+    /// Brizmo patch: `userAuthContext` only decides what message number 60 means (PK_OK by default, which is
+    /// the upstream behaviour; INFO_REQUEST while a keyboard-interactive request is in flight). Every other
+    /// message number is parsed exactly as before.
+    mutating func readSSHMessage(
+        userAuthContext: SSHPacketParser.UserAuthMessageContext = .default
+    ) throws -> SSHMessage? {
         try self.rewindOnNilOrError { `self` in
             guard let type = self.readInteger(as: UInt8.self) else {
                 return nil
@@ -437,10 +483,25 @@ extension ByteBuffer {
                 }
                 return .userAuthBanner(message)
             case SSHMessage.UserAuthPKOKMessage.id:
-                guard let message = try self.readUserAuthPKOKMessage() else {
+                // Brizmo patch: 60 is PK_OK or INFO_REQUEST depending on the method in flight (RFC 4252 §6).
+                switch userAuthContext {
+                case .default:
+                    guard let message = try self.readUserAuthPKOKMessage() else {
+                        return nil
+                    }
+                    return .userAuthPKOK(message)
+                case .keyboardInteractive:
+                    guard let message = self.readUserAuthInfoRequestMessage() else {
+                        return nil
+                    }
+                    return .userAuthInfoRequest(message)
+                }
+            case SSHMessage.UserAuthInfoResponseMessage.id:
+                // Brizmo patch (RFC 4256 §3.4): 61 has a single meaning.
+                guard let message = self.readUserAuthInfoResponseMessage() else {
                     return nil
                 }
-                return .userAuthPKOK(message)
+                return .userAuthInfoResponse(message)
             case SSHMessage.GlobalRequestMessage.id:
                 guard let message = try self.readGlobalRequestMessage() else {
                     return nil
@@ -678,6 +739,16 @@ extension ByteBuffer {
                 }
 
                 method = .password(password)
+            case "keyboard-interactive":
+                // Brizmo patch (RFC 4256 §3.1).
+                guard
+                    self.readSSHString() != nil,  // language tag: deprecated, ignored
+                    let submethods = self.readSSHStringAsString()
+                else {
+                    return nil
+                }
+
+                method = .keyboardInteractive(submethods: submethods.split(separator: ",").map(String.init))
             case "publickey":
                 guard
                     let expectSignature = self.readSSHBoolean(),
@@ -776,6 +847,72 @@ extension ByteBuffer {
             }
 
             return .init(key: publicKey)
+        }
+    }
+
+    /// Brizmo patch (RFC 4256 §3.2):
+    ///
+    ///     string    name
+    ///     string    instruction
+    ///     string    language tag (deprecated)
+    ///     int       num-prompts
+    ///     string    prompt[1]
+    ///     boolean   echo[1]
+    ///     ...
+    ///
+    /// `num-prompts` is not trusted for allocation: prompts are read one by one and a short buffer simply
+    /// yields `nil`, so a hostile count cannot make us reserve memory.
+    mutating func readUserAuthInfoRequestMessage() -> SSHMessage.UserAuthInfoRequestMessage? {
+        self.rewindReaderOnNil { `self` in
+            guard
+                let name = self.readSSHStringAsString(),
+                let instruction = self.readSSHStringAsString(),
+                let languageTag = self.readSSHStringAsString(),
+                let promptCount = self.readInteger(as: UInt32.self)
+            else {
+                return nil
+            }
+
+            var prompts: [SSHMessage.UserAuthInfoRequestMessage.Prompt] = []
+            var remaining = promptCount
+            while remaining > 0 {
+                guard
+                    let prompt = self.readSSHStringAsString(),
+                    let echo = self.readSSHBoolean()
+                else {
+                    return nil
+                }
+                prompts.append(.init(prompt: prompt, echo: echo))
+                remaining -= 1
+            }
+
+            return SSHMessage.UserAuthInfoRequestMessage(
+                name: name,
+                instruction: instruction,
+                languageTag: languageTag,
+                prompts: prompts
+            )
+        }
+    }
+
+    /// Brizmo patch (RFC 4256 §3.4): int num-responses, then that many strings. Same allocation rule as above.
+    mutating func readUserAuthInfoResponseMessage() -> SSHMessage.UserAuthInfoResponseMessage? {
+        self.rewindReaderOnNil { `self` in
+            guard let responseCount = self.readInteger(as: UInt32.self) else {
+                return nil
+            }
+
+            var responses: [String] = []
+            var remaining = responseCount
+            while remaining > 0 {
+                guard let response = self.readSSHStringAsString() else {
+                    return nil
+                }
+                responses.append(response)
+                remaining -= 1
+            }
+
+            return SSHMessage.UserAuthInfoResponseMessage(responses: responses)
         }
     }
 
@@ -1226,6 +1363,12 @@ extension ByteBuffer {
         case .userAuthPKOK(let message):
             writtenBytes += self.writeInteger(SSHMessage.UserAuthPKOKMessage.id)
             writtenBytes += self.writeUserAuthPKOKMessage(message)
+        case .userAuthInfoRequest(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoRequestMessage.id)
+            writtenBytes += self.writeUserAuthInfoRequestMessage(message)
+        case .userAuthInfoResponse(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoResponseMessage.id)
+            writtenBytes += self.writeUserAuthInfoResponseMessage(message)
         case .globalRequest(let message):
             writtenBytes += self.writeInteger(SSHMessage.GlobalRequestMessage.id)
             writtenBytes += self.writeGlobalRequestMessage(message)
@@ -1386,6 +1529,12 @@ extension ByteBuffer {
 
         case .publicKey(.unknown):
             preconditionFailure("We cannot write user auth request messages on unknown keys")
+
+        case .keyboardInteractive(let submethods):
+            // Brizmo patch (RFC 4256 §3.1): the language tag is deprecated and SHOULD be empty.
+            writtenBytes += self.writeSSHString("keyboard-interactive".utf8)
+            writtenBytes += self.writeSSHString("".utf8)
+            writtenBytes += self.writeSSHString(submethods.joined(separator: ",").utf8)
         }
 
         return writtenBytes
@@ -1410,6 +1559,30 @@ extension ByteBuffer {
         writtenBytes += self.writeSSHString(message.key.keyPrefix)
         writtenBytes += self.writeCompositeSSHString { buffer in
             buffer.writeSSHHostKey(message.key)
+        }
+        return writtenBytes
+    }
+
+    /// Brizmo patch (RFC 4256 §3.2).
+    mutating func writeUserAuthInfoRequestMessage(_ message: SSHMessage.UserAuthInfoRequestMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeSSHString(message.name.utf8)
+        writtenBytes += self.writeSSHString(message.instruction.utf8)
+        writtenBytes += self.writeSSHString(message.languageTag.utf8)
+        writtenBytes += self.writeInteger(UInt32(message.prompts.count))
+        for prompt in message.prompts {
+            writtenBytes += self.writeSSHString(prompt.prompt.utf8)
+            writtenBytes += self.writeSSHBoolean(prompt.echo)
+        }
+        return writtenBytes
+    }
+
+    /// Brizmo patch (RFC 4256 §3.4).
+    mutating func writeUserAuthInfoResponseMessage(_ message: SSHMessage.UserAuthInfoResponseMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeInteger(UInt32(message.responses.count))
+        for response in message.responses {
+            writtenBytes += self.writeSSHString(response.utf8)
         }
         return writtenBytes
     }

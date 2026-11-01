@@ -14,6 +14,11 @@
 // for NIOSSHHandler's re-key write holding. See BRIZMO-PATCH.md and
 // https://github.com/apple/swift-nio-ssh/issues/250.
 //
+// Modified by the Brizmo project (2026-11-01): `.userAuthentication` routes keyboard-interactive
+// (RFC 4256) INFO_REQUEST / INFO_RESPONSE in both directions; test-only `_userAuthMessageContextForTesting`
+// and `_abandonInFlightUserAuthRequestForTesting`.
+// See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -337,17 +342,34 @@ struct SSHConnectionStateMachine {
 
                     case .userAuthSuccess:
                         let result = try state.receiveUserAuthSuccess()
+                        // Brizmo patch: the request in flight is over; 60 means PK_OK again.
+                        state.resetUserAuthMessageContext()
                         // Hey, auth succeeded!
                         self = .active(ActiveState(state))
                         return result
 
                     case .userAuthFailure(let message):
                         let result = try state.receiveUserAuthFailure(message)
+                        // Brizmo patch: the request in flight is over; 60 means PK_OK again.
+                        state.resetUserAuthMessageContext()
                         self = .userAuthentication(state)
                         return result
 
                     case .userAuthBanner(let message):
                         let result = try state.receiveUserAuthBanner(message)
+                        self = .userAuthentication(state)
+                        return result
+
+                    case .userAuthInfoRequest(let message):
+                        // Brizmo patch (RFC 4256 §3.2): only parsed as such while our keyboard-interactive
+                        // request is in flight (see SSHPacketParser.UserAuthMessageContext).
+                        let result = try state.receiveUserAuthInfoRequest(message)
+                        self = .userAuthentication(state)
+                        return result
+
+                    case .userAuthInfoResponse(let message):
+                        // Brizmo patch (RFC 4256 §3.4).
+                        let result = try state.receiveUserAuthInfoResponse(message)
                         self = .userAuthentication(state)
                         return result
 
@@ -776,6 +798,29 @@ struct SSHConnectionStateMachine {
     /// The state of this state machine.
     private var state: State
 
+    /// Brizmo patch, testing only: what the packet parser currently takes message number 60 to be
+    /// (`nil` in states that hold no parser, e.g. after a disconnect).
+    internal var _userAuthMessageContextForTesting: SSHPacketParser.UserAuthMessageContext? {
+        switch self.state {
+        case .userAuthentication(let state):
+            return state.parser.userAuthMessageContext
+        case .active(let state):
+            return state.parser.userAuthMessageContext
+        default:
+            return nil
+        }
+    }
+
+    /// Brizmo patch, testing only: see `UserAuthenticationStateMachine._abandonInFlightRequestForTesting()`.
+    /// Lets a test client pipeline a second USERAUTH_REQUEST (RFC 4252 §5) so that the server's handling of an
+    /// aborted keyboard-interactive attempt can be driven over a real connection.
+    internal mutating func _abandonInFlightUserAuthRequestForTesting() {
+        if case .userAuthentication(var state) = self.state {
+            state.userAuthStateMachine._abandonInFlightRequestForTesting()
+            self.state = .userAuthentication(state)
+        }
+    }
+
     init(
         role: SSHConnectionRole,
         protectionSchemes: [NIOSSHTransportProtection.Type] = Constants.bundledTransportProtectionSchemes
@@ -964,6 +1009,8 @@ struct SSHConnectionStateMachine {
 
             case .userAuthRequest(let message):
                 try state.writeUserAuthRequest(message, into: &buffer)
+                // Brizmo patch: tell the parser what an inbound 60 means for this request.
+                state.updateUserAuthMessageContext(afterSending: message)
                 self.state = .userAuthentication(state)
 
             case .userAuthSuccess:
@@ -977,6 +1024,16 @@ struct SSHConnectionStateMachine {
 
             case .userAuthPKOK(let message):
                 try state.writeUserAuthPKOK(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoRequest(let message):
+                // Brizmo patch (RFC 4256 §3.2): server role.
+                try state.writeUserAuthInfoRequest(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoResponse(let message):
+                // Brizmo patch (RFC 4256 §3.4): client role.
+                try state.writeUserAuthInfoResponse(message, into: &buffer)
                 self.state = .userAuthentication(state)
 
             case .disconnect:

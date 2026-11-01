@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): keyboard-interactive (RFC 4256) INFO_REQUEST /
+// INFO_RESPONSE writers. See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -62,5 +65,23 @@ extension SendsUserAuthMessages {
     mutating func writeUserAuthPKOK(_ message: SSHMessage.UserAuthPKOKMessage, into buffer: inout ByteBuffer) throws {
         self.userAuthStateMachine.sendUserAuthPKOK(message)
         try self.serializer.serialize(message: .userAuthPKOK(message), to: &buffer)
+    }
+
+    // Brizmo patch (RFC 4256 §3.2): server role.
+    mutating func writeUserAuthInfoRequest(
+        _ message: SSHMessage.UserAuthInfoRequestMessage,
+        into buffer: inout ByteBuffer
+    ) throws {
+        try self.userAuthStateMachine.sendUserAuthInfoRequest(message)
+        try self.serializer.serialize(message: .userAuthInfoRequest(message), to: &buffer)
+    }
+
+    // Brizmo patch (RFC 4256 §3.4): client role.
+    mutating func writeUserAuthInfoResponse(
+        _ message: SSHMessage.UserAuthInfoResponseMessage,
+        into buffer: inout ByteBuffer
+    ) throws {
+        try self.userAuthStateMachine.sendUserAuthInfoResponse(message)
+        try self.serializer.serialize(message: .userAuthInfoResponse(message), to: &buffer)
     }
 }

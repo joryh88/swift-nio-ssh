@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): `keyboardInteractiveChallengeUnhandled` for
+// keyboard-interactive user authentication (RFC 4256). See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 /// An error thrown by NIOSSH.
@@ -139,6 +142,12 @@ extension NIOSSHError {
 
     internal static let globalRequestRefused = NIOSSHError(type: .globalRequestRefused, diagnostics: nil)
 
+    // Brizmo patch (RFC 4256): the default client delegate implementation fails challenges with this.
+    internal static let keyboardInteractiveChallengeUnhandled = NIOSSHError(
+        type: .keyboardInteractiveChallengeUnhandled,
+        diagnostics: nil
+    )
+
     @inline(never)
     internal static func remotePeerDoesNotSupportMessage(_ message: SSHMessage.UnimplementedMessage) -> NIOSSHError {
         NIOSSHError(type: .remotePeerDoesNotSupportMessage, diagnostics: "Sequence Number: \(message.sequenceNumber)")
@@ -207,6 +216,7 @@ extension NIOSSHError {
             case invalidHostKeyForKeyExchange
             case invalidOpenSSHPublicKey
             case invalidCertificate
+            case keyboardInteractiveChallengeUnhandled
         }
 
         private var base: Base
@@ -304,6 +314,14 @@ extension NIOSSHError {
 
         /// A certificate failed validation.
         public static let invalidCertificate: ErrorType = .init(.invalidCertificate)
+
+        /// The server sent a keyboard-interactive challenge (RFC 4256) but the client user authentication
+        /// delegate does not implement
+        /// ``NIOSSHClientUserAuthenticationDelegate/keyboardInteractiveChallengeReceived(_:responsePromise:)``.
+        /// Added by the Brizmo project.
+        public static let keyboardInteractiveChallengeUnhandled: ErrorType = .init(
+            .keyboardInteractiveChallengeUnhandled
+        )
     }
 }
 

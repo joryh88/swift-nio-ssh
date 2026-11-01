@@ -10,6 +10,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+// Modified by the Brizmo project (2026-11-01): keyboard-interactive (RFC 4256) INFO_REQUEST /
+// INFO_RESPONSE handling. See BRIZMO-PATCH.md.
+//
 //===----------------------------------------------------------------------===//
 
 import NIOCore
@@ -71,7 +74,8 @@ extension AcceptsUserAuthMessages {
     mutating func receiveUserAuthRequest(
         _ message: SSHMessage.UserAuthRequestMessage
     ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
-        let result = try self.userAuthStateMachine.receiveUserAuthRequest(message)
+        // Brizmo patch: the step form, which may also answer with a keyboard-interactive INFO_REQUEST.
+        let result = try self.userAuthStateMachine.receiveUserAuthRequestStep(message)
 
         if let future = result {
             let banner: SSHServerConfiguration.UserAuthBanner?
@@ -116,6 +120,49 @@ extension AcceptsUserAuthMessages {
     ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
         try self.userAuthStateMachine.receiveUserAuthBanner(message)
         return .event(NIOUserAuthBannerEvent(message: message.message, languageTag: message.languageTag))
+    }
+
+    /// Brizmo patch (RFC 4256 §3.2, client role): our answer goes out when the delegate has produced it.
+    mutating func receiveUserAuthInfoRequest(
+        _ message: SSHMessage.UserAuthInfoRequestMessage
+    ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
+        let future = try self.userAuthStateMachine.receiveUserAuthInfoRequest(message)
+        return .possibleFutureMessage(future.map { SSHMultiMessage(.userAuthInfoResponse($0)) })
+    }
+
+    /// Brizmo patch (RFC 4256 §3.4, server role): another challenge, or the outcome of the attempt.
+    mutating func receiveUserAuthInfoResponse(
+        _ message: SSHMessage.UserAuthInfoResponseMessage
+    ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
+        let result = try self.userAuthStateMachine.receiveUserAuthInfoResponse(message)
+
+        if let future = result {
+            let banner: SSHServerConfiguration.UserAuthBanner?
+            if case .server(let config) = role {
+                banner = config.banner
+            } else {
+                banner = nil
+            }
+
+            return .possibleFutureMessage(future.map { Self.transform($0, banner: banner) })
+        } else {
+            return .noMessage
+        }
+    }
+
+    private static func transform(
+        _ step: NIOSSHUserAuthenticationServerStepMessage,
+        banner: SSHServerConfiguration.UserAuthBanner?
+    ) -> SSHMultiMessage? {
+        switch step {
+        case .response(let response):
+            return Self.transform(response, banner: banner)
+        case .infoRequest(let message):
+            return SSHMultiMessage(.userAuthInfoRequest(message))
+        case .abandoned:
+            // Aborted keyboard-interactive attempt (RFC 4252 §5.1): no message; the handler writes nothing.
+            return nil
+        }
     }
 
     private static func transform(
